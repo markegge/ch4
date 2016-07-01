@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+  	<title>Pittsburgh Bus Bunching - March 2016</title>
+  	<style>
+  		html, body, #map-div {
+    	  margin: 0;
+    	  padding: 0;
+    	  height: 100%;
+    	}
+      #loading {
+        background: #fff url("loading.gif") no-repeat center;
+        pointer-events: none;
+        position: absolute;
+        height: 50px;
+        width: 50px;
+        z-index: 100;
+        top: 50%;
+        left: 50%;
+      }
+  	</style>
+
+    <link rel="stylesheet" type="text/css" href="https://ajax.googleapis.com/ajax/libs/jqueryui/1.11.4/themes/smoothness/jquery-ui.css">
+    <link rel="stylesheet" type="text/css" href="https://explorables.cmucreatelab.org/data-visualization-tools/css/defaultUI.css" />
+  </head>
+  <body>
+    <div id="loading"></div>
+    <div id="map-div"></div>
+    <div id="time-slider-controls"></div>
+
+
+    <script type="text/javascript">
+      /**
+       * create Google Maps baselayer.
+       * initMap() called by Maps API import
+       */      
+      var colorRamp = ['#a6cee3','#1f78b4','#b2df8a','#33a02c','#fb9a99','#e31a1c','#fdbf6f','#ff7f00','#cab2d6','#6a3d9a','#ffff99','#b15928'];
+      var lastColorIndex = 0;
+
+      function initMap() {
+        var mapOptions = {
+          zoom: 12,
+          center: new google.maps.LatLng(40.43884, -79.9198),
+          mapTypeControl: false
+        };
+        var mapDiv = document.getElementById('map-div');
+
+        map = new google.maps.Map(mapDiv, mapOptions);
+
+        // add routes from geoJSON file and set line colors
+        map.data.loadGeoJson('data/routes.geojson');        
+        map.data.setStyle(function(feature) {
+            var ascii = parseInt(feature.getProperty('OBJECTID'));
+            if(lastColorIndex++ >= colorRamp.length - 1) lastColorIndex = 0;
+            return {
+              strokeColor: colorRamp[lastColorIndex],
+              strokeOpacity: 0.75,
+              strokeWeight: 1.0
+            };
+        });
+
+        window.addEventListener('resize', function () {  google.maps.event.trigger(map, 'resize') }, false);
+      }
+    </script>
+
+    <script src="http://maps.googleapis.com/maps/api/js?callback=initMap"></script>
+
+    <script type="text/javascript" src="http://ajax.googleapis.com/ajax/libs/jquery/1.11.0/jquery.min.js"></script>
+    <script type="text/javascript" src="https://ajax.googleapis.com/ajax/libs/jqueryui/1.11.4/jquery-ui.min.js"></script>
+
+    <script type="text/javascript" src="http://explorables.cmucreatelab.org/data-visualization-tools/js/CanvasLayer.js"></script>
+    <script type="text/javascript" src="http://explorables.cmucreatelab.org/data-visualization-tools/js/TimeSlider.js"></script>
+
+    <script type="text/javascript">
+      /**
+       * Define webGL variables and define utility functions 
+       */
+      var gl;
+      var mapMatrix = new Float32Array(16);
+
+      var map;
+      var canvasLayer;
+      var timeSlider;
+
+      var points = {
+        name: 'points',
+        url: 'data/bunches.bin',
+        count: 0,
+        dataLoaded: false,
+        data: null,
+        callbackFunction: 'createPointBuffer'
+      }
+
+      function scaleMatrix(matrix, scaleX, scaleY) {
+        matrix[0] *= scaleX;
+        matrix[1] *= scaleX;
+        matrix[2] *= scaleX;
+        matrix[3] *= scaleX;
+        matrix[4] *= scaleY;
+        matrix[5] *= scaleY;
+        matrix[6] *= scaleY;
+        matrix[7] *= scaleY;
+      }
+
+      function translateMatrix(matrix, tx, ty) {
+        matrix[12] += matrix[0]*tx + matrix[4]*ty;
+        matrix[13] += matrix[1]*tx + matrix[5]*ty;
+        matrix[14] += matrix[2]*tx + matrix[6]*ty;
+        matrix[15] += matrix[3]*tx + matrix[7]*ty;
+      }
+
+      /**
+       * Given DOM reference to the vertex shader source and the fragement shader source, 
+       * returns a compiled program. With error checking.
+       * @type {String}, {String}
+       */
+      function createProgram(vertexSource, fragmentSource) {
+        var vertexSrc = document.getElementById(vertexSource).text; // assign text of source code for vertex-sharder
+        var vertexShader = gl.createShader(gl.VERTEX_SHADER); // create shader object
+        gl.shaderSource(vertexShader, vertexSrc); // pass source code to new shader object
+        gl.compileShader(vertexShader); // compile shader object
+
+        if (!gl.getShaderParameter(vertexShader, gl.COMPILE_STATUS))
+          console.log(gl.getShaderInfoLog(vertexShader));
+
+        // create fragment shader for points
+        var fragmentSrc = document.getElementById(fragmentSource).text; // same as previous for vertex
+        var fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
+        gl.shaderSource(fragmentShader, fragmentSrc);
+        gl.compileShader(fragmentShader);
+
+        if (!gl.getShaderParameter(fragmentShader, gl.COMPILE_STATUS))
+          console.log(gl.getShaderInfoLog(fragmentShader));
+
+        // link point shaders to create our program
+        program = gl.createProgram(); // create new program object
+        gl.attachShader(program, vertexShader); // attach shaders to program object
+        gl.attachShader(program, fragmentShader);
+        gl.linkProgram(program); // link shaders
+
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS))
+          console.log(gl.getProgramInfoLog(program));
+
+        return program;
+      }
+
+      function loadData(obj) {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', obj.url);
+        xhr.responseType = 'arraybuffer';
+        xhr.onload = function() {
+          obj.data = new Float32Array(this.response);
+          obj.dataLoaded = true;
+          window[obj.callbackFunction](); // when data is loaded, call obj's callback fn
+        }
+        xhr.send();
+      }
+
+      function resize() {
+        console.log('resize handler');
+        var w = gl.canvas.width;
+        var h = gl.canvas.height;
+        gl.viewport(0, 0, w, h);
+
+        var pixelsToWebGLMatrix = new Float32Array(16);
+
+        // matrix which maps pixel coordinates to WebGL coordinates
+        pixelsToWebGLMatrix.set([2/w, 0,   0, 0,
+                                  0,  -2/h, 0, 0,
+                                  0,   0,   0, 0,
+                                  -1,   1,   0, 1]);
+
+        var mapProjection = map.getProjection();
+        mapMatrix.set(pixelsToWebGLMatrix);
+        var scale = canvasLayer.getMapScale();
+        scaleMatrix(mapMatrix, scale, scale);
+        var translation = canvasLayer.getMapTranslation();
+        translateMatrix(mapMatrix, translation.x, translation.y);
+      }
+
+      /**
+       * Initialize WebGL. Called when DOM ready
+       */
+      function init() {
+        // initialize the canvas layer
+        var canvasLayerOptions = {
+          map: map,
+          resizeHandler: resize,
+          animate: true,
+          updateHandler: drawPoints
+        };
+
+        canvasLayer = new CanvasLayer(canvasLayerOptions); // create a new canvas
+
+        // initialize WebGL
+        gl = canvasLayer.canvas.getContext('experimental-webgl'); // get WebGL context for canvas element
+        if(gl == null) console.log('Error initializing WebGL. Check that you are using a supported browser and that hardware acceleration is enabled.');
+        gl.enable(gl.BLEND);
+        gl.blendFunc( gl.SRC_ALPHA, gl.ONE );
+
+        points.program = createProgram('point-vertex-shader', 'point-fragment-shader');
+
+        // initialize the TimeSlider. Note to self: javascript counts months from ZERO!!
+        timeSlider = new TimeSlider({
+          startTime: new Date(2016,0,1,5,0,0).getTime(),
+          endTime: new Date(2016,0,1,19,59,0).getTime(),
+          increment: 60*1000,          
+          dwellAnimationTime: 3*1000,
+          formatCurrentTime: function(date) {
+              var date = new Date(date);
+              var hrs = date.getHours();
+              var mins = date.getMinutes();
+              var res = (hrs > 12 ? hrs - 12 : hrs) + ':' + (mins < 10 ? "0" + mins : mins) + " " + (hrs >= 12 ? 'pm' : 'am');
+              return res;
+          },
+          animationRate: {
+            fast: 20,
+            medium: 40,
+            slow: 80
+          }
+        });
+
+        loadData(points); // load data asychronously
+      }
+
+      /**
+       * Called after data loaded into object.data. Loads data into a WebGL buffer
+       */
+      function createPointBuffer() {
+        points.count = points.data.length / 3;
+
+        points.arrayBuffer = gl.createBuffer();
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, points.arrayBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, points.data, gl.STATIC_DRAW);
+        
+        var el = document.getElementById("loading");
+        el.style['display'] = 'none';
+        points.dataLoaded = true;
+      }
+      /**
+       * Fired by CanvasLayer (controlled, in turn, by TimeSlider). 
+       * Link WebGL program to buffer data and call draw WebGL function
+       */
+      function drawPoints() {
+        if(points.dataLoaded) {
+          gl.useProgram(points.program)
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, points.arrayBuffer);
+        
+          // enable the 'worldCoord' attribute in the shader to receive buffer
+          var attributeLoc = gl.getAttribLocation(points.program, 'a_worldCoord');
+          gl.enableVertexAttribArray(attributeLoc);
+          gl.vertexAttribPointer(attributeLoc, 2, gl.FLOAT, false, 12, 0); // tell webgl how buffer is laid out (pairs of x,y coords)
+
+          // get the time values out of the buffer
+          var timeLocation = gl.getAttribLocation(points.program, "a_time");
+          gl.enableVertexAttribArray(timeLocation);
+          gl.vertexAttribPointer(timeLocation, 1, gl.FLOAT, false, 12, 8); // 8 byte offset
+        
+          var matrixLoc = gl.getUniformLocation(points.program, 'u_mapMatrix');
+          gl.uniformMatrix4fv(matrixLoc, false, mapMatrix);
+
+          var minTime = gl.getUniformLocation(points.program, 'u_minTime');
+          gl.uniform1f(minTime, (timeSlider.getCurrentTime()-timeSlider.span_)*1.0 - 15*60*1000); // keep data on screen for an extra 15 minutes to create trails
+
+          var maxTime = gl.getUniformLocation(points.program, 'u_maxTime');
+          gl.uniform1f(maxTime, timeSlider.getCurrentTime()*1.0);
+
+          var color = gl.getUniformLocation(points.program, "u_Color");
+          gl.uniform4fv(color, [0.8, 0.3, 0.3, 1.0]);
+
+          // draw!  
+          gl.drawArrays(gl.POINTS, 0, points.count);
+          timeSlider.animate();
+        }
+      }
+
+        
+      map.addListener('bounds_changed', resize, false);
+      document.addEventListener('DOMContentLoaded', init, false);
+    </script>
+
+    <!-- Create WebGL Shaders -->
+    <script type="x-shader/x-vertex" id="point-vertex-shader">
+        attribute vec4 a_worldCoord;
+        attribute float a_time;
+
+        uniform float u_maxTime;
+        uniform float u_minTime;
+
+        uniform mat4 u_mapMatrix;
+        void main() {
+          // transform world coordinate by matrix uniform variable
+          if ( a_time < u_minTime || a_time > u_maxTime ) {
+            gl_Position = vec4(-1,-1,-1,-1); // if outside of time window function, do not display
+          } else {
+            gl_Position = u_mapMatrix * a_worldCoord;
+          }
+
+          gl_PointSize = 20.0;
+        }
+    </script>
+
+    <script type="x-shader/x-vertex" id="point-fragment-shader">
+        precision mediump float;
+
+        uniform vec4 u_Color;
+        void main() {
+          float dist = distance( vec2(0.5, 0.5), gl_PointCoord);
+          dist = 1.0 - (dist * 2.0);
+          dist = max(0.0, dist);
+          gl_FragColor =  u_Color * dist;
+        } 
+    </script>
+  </body>
+</html>
